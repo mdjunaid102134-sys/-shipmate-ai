@@ -1,74 +1,166 @@
 require("dotenv").config();
+
 const express = require("express");
 const path = require("path");
+
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+const API_KEY = process.env.OPENROUTER_API_KEY;
+
+// OpenRouter-এর ফ্রি মডেল রাউটার
+const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
+
 app.use(express.json({ limit: "1mb" }));
+
 app.use(express.static(__dirname));
 
-const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
-app.get("/api/status", (_req, res) => res.json({
-  configured: Boolean(API_KEY && API_KEY !== "PASTE_YOUR_KEY_HERE"),
-  model: MODEL,
-  webSearchEnabled: true,
-  note: "Google Search grounding is requested for research answers; availability depends on model/API account."
-}));
+// Server status
+app.get("/api/status", (_req, res) => {
+  res.json({
+    success: true,
+    provider: "OpenRouter",
+    configured: Boolean(API_KEY),
+    model: MODEL
+  });
+});
 
-app.post("/api/chat", async (req, res) => {
-  if (!API_KEY || API_KEY === "PASTE_YOUR_KEY_HERE") {
-    return res.status(503).json({ error: "AI চালু করতে সার্ভারের .env ফাইলে Gemini API key যোগ করুন।" });
-  }
-  const message = String(req.body?.message || "").trim();
-  const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
-  if (!message) return res.status(400).json({ error: "মেসেজ লিখুন।" });
-
-  const systemInstruction = `You are ShipMate AI, a practical assistant for a beginner in Bangladesh building a commission-based international shipping lead-generation business.
-Reply in Bengali unless asked otherwise. Help with freight forwarders, shipping companies, prospecting, lead qualification, follow-ups, and commission tracking.
-For requests needing current facts, research the web using Google Search grounding when available. Clearly distinguish verified web facts from suggestions. Include source URLs in your answer when the grounded response provides them. If search fails or no sources are provided, say the information could not be live-verified.
-Never claim you contacted a company, sent a message, opened a phone app, or submitted a form.
-SECURITY: Never send messages, contact customers, submit forms, or make commitments. You may draft a message. This app has no external sending integration. A human must review and approve each exact draft separately. Approval in this app only marks a draft approved; it does not send it.`;
-
-  const contents = [
-    ...history.filter(x => x && ["user", "model"].includes(x.role) && typeof x.text === "string")
-      .map(x => ({ role: x.role, parts: [{ text: x.text.slice(0, 5000) }] })),
-    { role: "user", parts: [{ text: message.slice(0, 10000) }] }
-  ];
+// AI chat
+async function handleChat(req, res) {
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent?key=${encodeURIComponent(API_KEY)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemInstruction }] },
-          contents,
-          tools: [{ google_search: {} }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 1600 }
-        })
-      }
-    );
-    const data = await response.json();
-    if (!response.ok) {
-      const msg = data?.error?.message || "AI provider request failed.";
-      return res.status(response.status).json({
-        error: "AI/Search সংযোগে সমস্যা: " + msg + "\nAPI key, model access এবং Google AI Studio usage limit পরীক্ষা করুন।"
+    if (!API_KEY) {
+      return res.status(503).json({
+        error: "OpenRouter API key কনফিগার করা নেই।"
       });
     }
-    const candidate = data?.candidates?.[0];
-    const answer = (candidate?.content?.parts || []).map(p => p.text || "").join("").trim();
-    const grounding = candidate?.groundingMetadata;
-    const sources = [];
-    for (const chunk of (grounding?.groundingChunks || [])) {
-      const web = chunk?.web;
-      if (web?.uri && !sources.some(s => s.url === web.uri)) {
-        sources.push({ title: web.title || web.uri, url: web.uri });
-      }
+
+    const { message, messages } = req.body || {};
+
+    let chatMessages;
+
+    if (Array.isArray(messages) && messages.length > 0) {
+      chatMessages = messages;
+    } else if (
+      typeof message === "string" &&
+      message.trim()
+    ) {
+      chatMessages = [
+        { role: "user", content: message.trim() }
+      ];
+    } else {
+      return res.status(400).json({
+        error: "একটি সঠিক মেসেজ পাঠান।"
+      });
     }
-    if (!answer) return res.status(502).json({ error: "AI থেকে উত্তর পাওয়া যায়নি। আবার চেষ্টা করুন।" });
-    res.json({ answer, model: MODEL, sources, searchUsed: sources.length > 0 });
-  } catch (_err) {
-    res.status(502).json({ error: "সার্ভারের সঙ্গে সংযোগ হয়নি। সার্ভার ও ইন্টারনেট পরীক্ষা করুন।" });
+
+    if (chatMessages.length > 50) {
+      return res.status(400).json({
+        error: "একবারে সর্বোচ্চ ৫০টি মেসেজ পাঠানো যাবে।"
+      });
+    }
+
+    const validMessages = chatMessages.every((item) =>
+      item &&
+      ["user", "assistant"].includes(item.role) &&
+      typeof item.content === "string" &&
+      item.content.trim().length > 0 &&
+      item.content.length <= 20000
+    );
+
+    if (!validMessages) {
+      return res.status(400).json({
+        error: "মেসেজের ফরম্যাট সঠিক নয়।"
+      });
+    }
+
+    const response = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          "Content-Type": "application/json",
+          "X-Title": "ShipMate AI"
+        },
+        body: JSON.stringify({
+          model: MODEL,
+          messages: chatMessages,
+          stream: false
+        }),
+        signal: AbortSignal.timeout(60000)
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error("OpenRouter API error:", {
+        status: response.status,
+        code: data?.error?.code,
+        message: data?.error?.message
+      });
+
+      if (response.status === 429) {
+        return res.status(429).json({
+          error:
+            "ফ্রি AI ব্যবহারের সীমা শেষ হয়েছে। পরে আবার চেষ্টা করুন।"
+        });
+      }
+
+      if (response.status === 401 ||
+          response.status === 403) {
+        return res.status(502).json({
+          error:
+            "OpenRouter API key বা মডেল ব্যবহারের অনুমতিতে সমস্যা হয়েছে।"
+        });
+      }
+
+      return res.status(502).json({
+        error:
+          "AI সার্ভার বর্তমানে উত্তর দিতে পারছে না। পরে আবার চেষ্টা করুন।"
+      });
+    }
+
+    const reply =
+      data?.choices?.[0]?.message?.content;
+
+    if (typeof reply !== "string" || !reply.trim()) {
+      return res.status(502).json({
+        error: "AI থেকে কোনো উত্তর পাওয়া যায়নি।"
+      });
+    }
+
+    return res.json({
+      success: true,
+      provider: "OpenRouter",
+      model: data.model || MODEL,
+      reply: reply.trim()
+    });
+
+  } catch (error) {
+    console.error("Chat request failed:", error.message);
+
+    if (error.name === "TimeoutError" ||
+        error.name === "AbortError") {
+      return res.status(504).json({
+        error: "AI উত্তর দিতে বেশি সময় নিচ্ছে। আবার চেষ্টা করুন।"
+      });
+    }
+
+    return res.status(502).json({
+      error: "AI সার্ভারের সঙ্গে সংযোগ করা যায়নি।"
+    });
   }
+}
+
+// মূল chat endpoint
+app.post("/api/chat", handleChat);
+
+// আগের বিকল্প endpoint-এর সঙ্গে সামঞ্জস্য
+app.post("/api/alternative-chat", handleChat);
+
+app.listen(PORT, () => {
+  console.log(`ShipMate AI running on port ${PORT}`);
+  console.log(`AI provider: OpenRouter`);
+  console.log(`AI model: ${MODEL}`);
 });
-const port = Number(process.env.PORT || 3000);
-app.listen(port, () => console.log(`ShipMate AI running on port ${port}`));
