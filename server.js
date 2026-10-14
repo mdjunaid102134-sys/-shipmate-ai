@@ -6,8 +6,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.static(__dirname));
 
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 app.get("/api/status", (_req, res) => res.json({
   configured: Boolean(API_KEY && API_KEY !== "PASTE_YOUR_KEY_HERE"),
   model: MODEL,
