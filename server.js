@@ -1,166 +1,65 @@
 require("dotenv").config();
-
 const express = require("express");
 const path = require("path");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const { Pool } = require("pg");
+const nodemailer = require("nodemailer");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 const API_KEY = process.env.OPENROUTER_API_KEY;
-
-// OpenRouter-এর ফ্রি মডেল রাউটার
 const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
+const ADMIN_TOKEN = process.env.APPROVAL_ADMIN_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL;
+const BRAVE_KEY = process.env.BRAVE_SEARCH_API_KEY;
 
+if (!DATABASE_URL) { console.error("FATAL: DATABASE_URL is required."); process.exit(1); }
+if (!ADMIN_TOKEN || ADMIN_TOKEN.length < 24) { console.error("FATAL: APPROVAL_ADMIN_TOKEN must be at least 24 characters."); process.exit(1); }
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : undefined, connectionTimeoutMillis: 10000, max: 10 });
+app.disable("x-powered-by");
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: "1mb" }));
+app.use(express.static(__dirname))
+app.use("/api/", rateLimit({ windowMs: 60000, limit: 90, standardHeaders: true, legacyHeaders: false }));
 
-app.use(express.static(__dirname));
+function safeEqual(a,b){const aa=Buffer.from(String(a||"")),bb=Buffer.from(String(b||""));return aa.length===bb.length&&crypto.timingSafeEqual(aa,bb);}
+function requireAdmin(req,res,next){if(!safeEqual(req.get("x-approval-token"),ADMIN_TOKEN))return res.status(401).json({success:false,error:"Admin token সঠিক নয়।"});next();}
+function field(v,n,max=5000,optional=true){if(v==null&&optional)return "";if(typeof v!=="string"||v.length>max||(!optional&&!v.trim()))throw Error(`${n} ফিল্ডটি সঠিক নয়।`);return v.trim();}
+function validUrl(v){if(!v)return true;try{const u=new URL(v);return u.protocol==="http:"||u.protocol==="https:";}catch{return false;}}
+function validEmail(v){return typeof v==="string"&&/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)&&v.length<=254;}
+function smtpReady(){return Boolean(process.env.SMTP_HOST&&process.env.SMTP_USER&&process.env.SMTP_PASS&&process.env.SMTP_FROM);}
+function transporter(){return nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:String(process.env.SMTP_SECURE||"false")==="true",auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}});}
+async function log(type,entity,id,message){await pool.query("INSERT INTO activity_log(event_type,entity_type,entity_id,message) VALUES($1,$2,$3,$4)",[type,entity,String(id||""),message||""]);}
+async function initDb(){await pool.query(`
+CREATE TABLE IF NOT EXISTS saved_companies(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,website TEXT NOT NULL DEFAULT '',country TEXT NOT NULL DEFAULT '',contact_email TEXT NOT NULL DEFAULT '',contact_url TEXT NOT NULL DEFAULT '',source_url TEXT NOT NULL DEFAULT '',notes TEXT NOT NULL DEFAULT '',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS saved_clients(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,website TEXT NOT NULL DEFAULT '',country TEXT NOT NULL DEFAULT '',contact_email TEXT NOT NULL DEFAULT '',facebook_url TEXT NOT NULL DEFAULT '',linkedin_url TEXT NOT NULL DEFAULT '',source_url TEXT NOT NULL DEFAULT '',shipping_need TEXT NOT NULL DEFAULT '',notes TEXT NOT NULL DEFAULT '',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS applications(id BIGSERIAL PRIMARY KEY,company_name TEXT NOT NULL,recipient_email TEXT NOT NULL DEFAULT '',website TEXT NOT NULL DEFAULT '',application_url TEXT NOT NULL DEFAULT '',subject TEXT NOT NULL DEFAULT '',body TEXT NOT NULL DEFAULT '',details JSONB NOT NULL DEFAULT '{}'::jsonb,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN('pending','approved','rejected','sent','submitted_manually')),review_note TEXT NOT NULL DEFAULT '',sent_message_id TEXT NOT NULL DEFAULT '',sent_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),reviewed_at TIMESTAMPTZ);
+CREATE TABLE IF NOT EXISTS activity_log(id BIGSERIAL PRIMARY KEY,event_type TEXT NOT NULL,entity_type TEXT NOT NULL DEFAULT '',entity_id TEXT NOT NULL DEFAULT '',message TEXT NOT NULL DEFAULT '',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`);}
 
-// Server status
-app.get("/api/status", (_req, res) => {
-  res.json({
-    success: true,
-    provider: "OpenRouter",
-    configured: Boolean(API_KEY),
-    model: MODEL
-  });
-});
+app.get("/api/status",(_req,res)=>res.json({success:true,provider:"OpenRouter",configured:Boolean(API_KEY),model:MODEL,databaseConfigured:Boolean(DATABASE_URL),webSearchConfigured:Boolean(BRAVE_KEY),emailSendingConfigured:smtpReady(),humanApprovalRequired:true,automaticSubmission:false}));
 
-// AI chat
-async function handleChat(req, res) {
-  try {
-    if (!API_KEY) {
-      return res.status(503).json({
-        error: "OpenRouter API key কনফিগার করা নেই।"
-      });
-    }
+async function chatHandler(req,res){try{if(!API_KEY)return res.status(503).json({error:"OPENROUTER_API_KEY সেট করা নেই।"});const {message,messages}=req.body||{};let ms;if(Array.isArray(messages)&&messages.length)ms=messages;else if(typeof message==="string"&&message.trim())ms=[{role:"user",content:message.trim()}];else return res.status(400).json({error:"একটি সঠিক মেসেজ পাঠান।"});if(ms.length>50)return res.status(400).json({error:"একবারে সর্বোচ্চ ৫০টি মেসেজ পাঠানো যাবে।"});if(!ms.every(m=>m&&["user","assistant"].includes(m.role)&&typeof m.content==="string"&&m.content.trim()&&m.content.length<=20000))return res.status(400).json({error:"মেসেজের ফরম্যাট সঠিক নয়।"});const system={role:"system",content:"You are ShipMate AI, an international shipping-agent research assistant. Never claim to have searched the web unless search results were supplied. Never invent company details, job openings, public emails, commission terms or submission outcomes. Separate verified facts from assumptions. Every application requires explicit human approval before submission. Never request passwords or one-time codes. Arbitrary websites may require manual submission."};const r=await fetch("https://openrouter.ai/api/v1/chat/completions",{method:"POST",headers:{Authorization:`Bearer ${API_KEY}`,"Content-Type":"application/json","X-Title":"ShipMate AI"},body:JSON.stringify({model:MODEL,messages:[system,...ms],stream:false}),signal:AbortSignal.timeout(60000)});const d=await r.json().catch(()=>({}));if(!r.ok){console.error("OpenRouter:",r.status,d?.error?.message||"");return res.status(r.status===429?429:502).json({error:r.status===429?"AI rate limit শেষ। পরে চেষ্টা করুন।":"OpenRouter AI উত্তর দিতে পারেনি।"});}const reply=d?.choices?.[0]?.message?.content;if(typeof reply!=="string"||!reply.trim())return res.status(502).json({error:"AI থেকে উত্তর পাওয়া যায়নি।"});res.json({success:true,provider:"OpenRouter",model:d.model||MODEL,reply:reply.trim()});}catch(e){console.error("Chat:",e.message);res.status(e.name==="TimeoutError"||e.name==="AbortError"?504:502).json({error:"AI অনুরোধ সম্পন্ন হয়নি। আবার চেষ্টা করুন।"});}}
+app.post("/api/chat",requireAdmin,chatHandler);
+app.post("/api/alternative-chat",requireAdmin,chatHandler);
 
-    const { message, messages } = req.body || {};
+app.get("/api/research/search",requireAdmin,async(req,res)=>{try{if(!BRAVE_KEY)return res.status(503).json({error:"BRAVE_SEARCH_API_KEY সেট করুন।"});const q=field(req.query.q,"q",300,false);if(q.length<2)return res.status(400).json({error:"কমপক্ষে ২ অক্ষরের সার্চ লিখুন।"});const u=new URL("https://api.search.brave.com/res/v1/web/search");u.searchParams.set("q",q);u.searchParams.set("count","10");u.searchParams.set("safesearch","moderate");const r=await fetch(u,{headers:{"X-Subscription-Token":BRAVE_KEY,Accept:"application/json"},signal:AbortSignal.timeout(20000)});const d=await r.json().catch(()=>({}));if(!r.ok){console.error("Brave Search:",r.status);return res.status(502).json({error:"Search provider অনুরোধ নেয়নি; API key/plan পরীক্ষা করুন।"});}res.json({success:true,query:q,results:(d.web?.results||[]).slice(0,10).map(x=>({title:String(x.title||"").slice(0,500),url:String(x.url||""),description:String(x.description||"").slice(0,3000),age:String(x.age||"")}))});}catch(e){console.error("Search:",e.message);res.status(502).json({error:"Web search ব্যর্থ হয়েছে।"});}});
 
-    let chatMessages;
+app.get("/api/companies",requireAdmin,async(_req,res)=>{try{const r=await pool.query("SELECT * FROM saved_companies ORDER BY created_at DESC LIMIT 500");res.json({success:true,items:r.rows});}catch{res.status(500).json({error:"কোম্পানির তালিকা লোড হয়নি।"});}});
+app.post("/api/companies",requireAdmin,async(req,res)=>{try{const b=req.body||{},v=[field(b.name,"name",300,false),field(b.website,"website",1000),field(b.country,"country",200),field(b.contact_email,"contact_email",254),field(b.contact_url,"contact_url",1000),field(b.source_url,"source_url",1000),field(b.notes,"notes",5000)];if(![v[1],v[4],v[5]].every(validUrl))return res.status(400).json({error:"URL অবশ্যই http/https হতে হবে।"});if(v[3]&&!validEmail(v[3]))return res.status(400).json({error:"ইমেইল সঠিক নয়।"});const r=await pool.query("INSERT INTO saved_companies(name,website,country,contact_email,contact_url,source_url,notes) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",v);await log("saved","company",r.rows[0].id,`Saved company: ${v[0]}`);res.status(201).json({success:true,item:r.rows[0]});}catch(e){res.status(400).json({error:e.message||"কোম্পানি সেভ হয়নি।"});}});
+app.delete("/api/companies/:id",requireAdmin,async(req,res)=>{if(!/^\d+$/.test(req.params.id))return res.status(400).json({error:"ID সঠিক নয়।"});try{await pool.query("DELETE FROM saved_companies WHERE id=$1",[req.params.id]);await log("deleted","company",req.params.id,"Deleted company");res.json({success:true});}catch{res.status(500).json({error:"কোম্পানি মোছা যায়নি।"});}});
 
-    if (Array.isArray(messages) && messages.length > 0) {
-      chatMessages = messages;
-    } else if (
-      typeof message === "string" &&
-      message.trim()
-    ) {
-      chatMessages = [
-        { role: "user", content: message.trim() }
-      ];
-    } else {
-      return res.status(400).json({
-        error: "একটি সঠিক মেসেজ পাঠান।"
-      });
-    }
+app.get("/api/clients",requireAdmin,async(_req,res)=>{try{const r=await pool.query("SELECT * FROM saved_clients ORDER BY created_at DESC LIMIT 500");res.json({success:true,items:r.rows});}catch{res.status(500).json({error:"ক্লায়েন্টের তালিকা লোড হয়নি।"});}});
+app.post("/api/clients",requireAdmin,async(req,res)=>{try{const b=req.body||{},v=[field(b.name,"name",300,false),field(b.website,"website",1000),field(b.country,"country",200),field(b.contact_email,"contact_email",254),field(b.facebook_url,"facebook_url",1000),field(b.linkedin_url,"linkedin_url",1000),field(b.source_url,"source_url",1000),field(b.shipping_need,"shipping_need",3000),field(b.notes,"notes",5000)];if(![v[1],v[4],v[5],v[6]].every(validUrl))return res.status(400).json({error:"URL অবশ্যই http/https হতে হবে।"});if(v[3]&&!validEmail(v[3]))return res.status(400).json({error:"ইমেইল সঠিক নয়।"});const r=await pool.query("INSERT INTO saved_clients(name,website,country,contact_email,facebook_url,linkedin_url,source_url,shipping_need,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *",v);await log("saved","client",r.rows[0].id,`Saved client: ${v[0]}`);res.status(201).json({success:true,item:r.rows[0]});}catch(e){res.status(400).json({error:e.message||"ক্লায়েন্ট সেভ হয়নি।"});}});
+app.delete("/api/clients/:id",requireAdmin,async(req,res)=>{if(!/^\d+$/.test(req.params.id))return res.status(400).json({error:"ID সঠিক নয়।"});try{await pool.query("DELETE FROM saved_clients WHERE id=$1",[req.params.id]);await log("deleted","client",req.params.id,"Deleted client");res.json({success:true});}catch{res.status(500).json({error:"ক্লায়েন্ট মোছা যায়নি।"});}});
 
-    if (chatMessages.length > 50) {
-      return res.status(400).json({
-        error: "একবারে সর্বোচ্চ ৫০টি মেসেজ পাঠানো যাবে।"
-      });
-    }
+app.get("/api/applications",requireAdmin,async(req,res)=>{try{const status=req.query.status,allowed=["pending","approved","rejected","sent","submitted_manually"];if(status&&!allowed.includes(status))return res.status(400).json({error:"status সঠিক নয়।"});const r=status?await pool.query("SELECT * FROM applications WHERE status=$1 ORDER BY created_at DESC LIMIT 300",[status]):await pool.query("SELECT * FROM applications ORDER BY created_at DESC LIMIT 300");res.json({success:true,items:r.rows});}catch{res.status(500).json({error:"আবেদনের তালিকা লোড হয়নি।"});}});
+app.post("/api/applications",requireAdmin,async(req,res)=>{try{const b=req.body||{},v=[field(b.company_name,"company_name",300,false),field(b.recipient_email,"recipient_email",254),field(b.website,"website",1000),field(b.application_url,"application_url",1000),field(b.subject,"subject",500),field(b.body,"body",15000)];const details=b.details&&typeof b.details==="object"&&!Array.isArray(b.details)?b.details:{};if(![v[2],v[3]].every(validUrl))return res.status(400).json({error:"Website ও application URL http/https হতে হবে।"});if(v[1]&&!validEmail(v[1]))return res.status(400).json({error:"Recipient email সঠিক নয়।"});const r=await pool.query("INSERT INTO applications(company_name,recipient_email,website,application_url,subject,body,details) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",[...v,JSON.stringify(details)]);await log("created","application",r.rows[0].id,`Draft for ${v[0]}; not sent`);res.status(201).json({success:true,message:"Draft সেভ হয়েছে। কিছু পাঠানো হয়নি।",item:r.rows[0]});}catch(e){res.status(400).json({error:e.message||"Draft সেভ হয়নি।"});}});
+app.patch("/api/applications/:id/decision",requireAdmin,async(req,res)=>{try{if(!/^\d+$/.test(req.params.id))return res.status(400).json({error:"ID সঠিক নয়।"});const {decision,review_note=""}=req.body||{};if(!["approved","rejected"].includes(decision))return res.status(400).json({error:"decision approved অথবা rejected হতে হবে।"});const note=field(review_note,"review_note",3000);const r=await pool.query("UPDATE applications SET status=$1,review_note=$2,reviewed_at=NOW() WHERE id=$3 AND status='pending' RETURNING *",[decision,note,req.params.id]);if(!r.rowCount)return res.status(409).json({error:"Draft নেই অথবা আগে সিদ্ধান্ত হয়েছে।"});await log("decision","application",req.params.id,`Application ${decision}; not sent`);res.json({success:true,message:decision==="approved"?"Approved; এখনও পাঠানো হয়নি। Send আলাদাভাবে চাপতে হবে.":"Rejected.",item:r.rows[0]});}catch{res.status(500).json({error:"সিদ্ধান্ত সেভ হয়নি।"});}});
+app.post("/api/applications/:id/send",requireAdmin,async(req,res)=>{try{if(!/^\d+$/.test(req.params.id))return res.status(400).json({error:"ID সঠিক নয়।"});if(req.body?.confirmation!=="SEND APPLICATION")return res.status(400).json({error:'confirmation: "SEND APPLICATION" প্রয়োজন।'});if(!smtpReady())return res.status(503).json({error:"SMTP সেট করা নেই। ইমেইল পাঠানো বন্ধ।"});const found=await pool.query("SELECT * FROM applications WHERE id=$1",[req.params.id]);if(!found.rowCount)return res.status(404).json({error:"আবেদন পাওয়া যায়নি।"});const a=found.rows[0];if(a.status!=="approved")return res.status(409).json({error:"প্রথমে আবেদন approve করতে হবে।"});if(!validEmail(a.recipient_email))return res.status(400).json({error:"Recipient email সঠিক নয়।"});if(!a.subject.trim()||!a.body.trim())return res.status(400).json({error:"Email subject ও body প্রয়োজন।"});const info=await transporter().sendMail({from:process.env.SMTP_FROM,to:a.recipient_email,subject:a.subject,text:a.body});const r=await pool.query("UPDATE applications SET status='sent',sent_message_id=$1,sent_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",[String(info.messageId||""),a.id]);await log("sent","application",a.id,`SMTP accepted email to ${a.recipient_email}`);res.json({success:true,message:"SMTP provider ইমেইল গ্রহণ করেছে; প্রাপকের কাছে পৌঁছেছে তার নিশ্চয়তা নয়।",item:r.rows[0]});}catch(e){console.error("Send:",e.message);res.status(502).json({error:"ইমেইল পাঠানো যায়নি। SMTP configuration পরীক্ষা করুন।"});}});
+app.post("/api/applications/:id/mark-submitted",requireAdmin,async(req,res)=>{try{if(req.body?.confirmation!=="I SUBMITTED THIS APPLICATION")return res.status(400).json({error:'confirmation: "I SUBMITTED THIS APPLICATION" প্রয়োজন।'});const r=await pool.query("UPDATE applications SET status='submitted_manually',sent_at=NOW() WHERE id=$1 AND status='approved' RETURNING *",[req.params.id]);if(!r.rowCount)return res.status(409).json({error:"শুধু approved draft-ই mark করা যাবে।"});await log("submitted_manually","application",req.params.id,"User confirmed manual submission");res.json({success:true,item:r.rows[0],message:"তোমার নিশ্চিতকরণ অনুযায়ী রেকর্ড হয়েছে।"});}catch{res.status(500).json({error:"Status সেভ হয়নি।"});}});
+app.get("/api/activity",requireAdmin,async(_req,res)=>{try{const r=await pool.query("SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 100");res.json({success:true,items:r.rows});}catch{res.status(500).json({error:"Activity log পাওয়া যায়নি।"});}});
+app.get("*",(_req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
 
-    const validMessages = chatMessages.every((item) =>
-      item &&
-      ["user", "assistant"].includes(item.role) &&
-      typeof item.content === "string" &&
-      item.content.trim().length > 0 &&
-      item.content.length <= 20000
-    );
-
-    if (!validMessages) {
-      return res.status(400).json({
-        error: "মেসেজের ফরম্যাট সঠিক নয়।"
-      });
-    }
-
-    const response = await fetch(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${API_KEY}`,
-          "Content-Type": "application/json",
-          "X-Title": "ShipMate AI"
-        },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: chatMessages,
-          stream: false
-        }),
-        signal: AbortSignal.timeout(60000)
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error("OpenRouter API error:", {
-        status: response.status,
-        code: data?.error?.code,
-        message: data?.error?.message
-      });
-
-      if (response.status === 429) {
-        return res.status(429).json({
-          error:
-            "ফ্রি AI ব্যবহারের সীমা শেষ হয়েছে। পরে আবার চেষ্টা করুন।"
-        });
-      }
-
-      if (response.status === 401 ||
-          response.status === 403) {
-        return res.status(502).json({
-          error:
-            "OpenRouter API key বা মডেল ব্যবহারের অনুমতিতে সমস্যা হয়েছে।"
-        });
-      }
-
-      return res.status(502).json({
-        error:
-          "AI সার্ভার বর্তমানে উত্তর দিতে পারছে না। পরে আবার চেষ্টা করুন।"
-      });
-    }
-
-    const reply =
-      data?.choices?.[0]?.message?.content;
-
-    if (typeof reply !== "string" || !reply.trim()) {
-      return res.status(502).json({
-        error: "AI থেকে কোনো উত্তর পাওয়া যায়নি।"
-      });
-    }
-
-    return res.json({
-      success: true,
-      provider: "OpenRouter",
-      model: data.model || MODEL,
-      reply: reply.trim()
-    });
-
-  } catch (error) {
-    console.error("Chat request failed:", error.message);
-
-    if (error.name === "TimeoutError" ||
-        error.name === "AbortError") {
-      return res.status(504).json({
-        error: "AI উত্তর দিতে বেশি সময় নিচ্ছে। আবার চেষ্টা করুন।"
-      });
-    }
-
-    return res.status(502).json({
-      error: "AI সার্ভারের সঙ্গে সংযোগ করা যায়নি।"
-    });
-  }
-}
-
-// মূল chat endpoint
-app.post("/api/chat", handleChat);
-
-// আগের বিকল্প endpoint-এর সঙ্গে সামঞ্জস্য
-app.post("/api/alternative-chat", handleChat);
-
-app.listen(PORT, () => {
-  console.log(`ShipMate AI running on port ${PORT}`);
-  console.log(`AI provider: OpenRouter`);
-  console.log(`AI model: ${MODEL}`);
-});
+(async()=>{try{await initDb();app.listen(PORT,()=>console.log(`ShipMate AI running on ${PORT}; model=${MODEL}; automatic submission=DISABLED`));}catch(e){console.error("Startup failed:",e.message);process.exit(1);}})();
